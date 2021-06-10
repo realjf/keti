@@ -6,16 +6,22 @@ import (
 	"os/signal"
 	"syscall"
 
-	log "github.com/golang/glog"
+	"github.com/realjf/keti/internal/logic/config"
+	"github.com/realjf/keti/pkg/utils"
 )
 
 var (
+	log = utils.Logger
 	ver = "1.0.0"
 )
 
 func main() {
 	flag.Parse()
-	log.Infof("keti-logic [version: %s env: %+v] start", ver)
+	err := config.Init()
+	if err != nil {
+		panic(err)
+	}
+	log.Infof("keti-logic [version: %s] start", ver)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
@@ -26,7 +32,6 @@ func main() {
 		case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
 
 			log.Infof("keti-logic [version: %s] exit", ver)
-			log.Flush()
 			return
 		case syscall.SIGHUP:
 		default:

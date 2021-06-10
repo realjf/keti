@@ -3,6 +3,7 @@ module github.com/realjf/keti
 go 1.16
 
 require (
+	github.com/BurntSushi/toml v0.3.1
 	github.com/fastly/go-utils v0.0.0-20180712184237-d95a45783239 // indirect
 	github.com/gogf/gf v1.16.2
 	github.com/golang/glog v0.0.0-20210429001901-424d2337a529

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	LogDir  = "../log"
+	LogDir  = "log"
 	LogFile = LogDir + "/keti"
 )
 
