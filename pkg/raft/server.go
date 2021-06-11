@@ -22,11 +22,13 @@ type Server struct {
 	peerIds  []int // 同伴服务器id
 
 	cm       *ConsensusModule // 共识模块
-	rpcProxy *RPCProxy        // rpc代理
+	storage  Storage
+	rpcProxy *RPCProxy // rpc代理
 
 	rpcServer *rpc.Server  // rpc服务端
 	listener  net.Listener // 监听器
 
+	commitChan  chan<- CommitEntry
 	peerClients map[int]*rpc.Client // 同伴rpc客户端
 
 	ready <-chan interface{} // 准备通道
@@ -34,19 +36,22 @@ type Server struct {
 	wg    sync.WaitGroup     // 同步量
 }
 
-func NewServer(serverId int, peerIds []int, ready <-chan interface{}) *Server {
+func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *Server {
 	s := new(Server)
 	s.serverId = serverId
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
+	s.storage = storage
 	s.ready = ready
+	s.commitChan = commitChan
 	s.quit = make(chan interface{})
 	return s
 }
 
+// 提供服务
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready)
+	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.ready, s.commitChan)
 
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = &RPCProxy{cm: s.cm}
@@ -83,6 +88,7 @@ func (s *Server) Serve() {
 	}()
 }
 
+// 释放所有rpc连接
 func (s *Server) DisconnectAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -94,6 +100,7 @@ func (s *Server) DisconnectAll() {
 	}
 }
 
+// 关闭服务
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	close(s.quit)
@@ -101,12 +108,14 @@ func (s *Server) Shutdown() {
 	s.wg.Wait()
 }
 
+// 获取服务器地址
 func (s *Server) GetListenAddr() net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listener.Addr()
 }
 
+// 与同伴服务器互相建立rpc连接
 func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -120,6 +129,7 @@ func (s *Server) ConnectToPeer(peerId int, addr net.Addr) error {
 	return nil
 }
 
+// 释放某个rpc服务连接
 func (s *Server) DisconnectPeer(peerId int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -131,6 +141,7 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	return nil
 }
 
+// 调用服务
 func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
 	s.mu.Lock()
 	peer := s.peerClients[id]
@@ -147,6 +158,7 @@ type RPCProxy struct {
 	cm *ConsensusModule
 }
 
+// 请求投票
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
@@ -163,6 +175,7 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 	return rpp.cm.RequestVote(args, reply)
 }
 
+//
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)

@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -11,6 +13,21 @@ import (
 )
 
 const DebugCM = 1
+
+/*
+	CommitEntry就是Raft向提交通道发送的数据。每一条提交的条目都会通知客户端，
+	表明指令已满足一致性，可以应用到客户端的状态机上。
+*/
+type CommitEntry struct {
+	// Command 是被提交的客户端指令
+	Command interface{}
+
+	// Index 是被提交的客户端指令对应的日志索引
+	Index int
+
+	// Term 是被提交的客户端指令对应的任期
+	Term int
+}
 
 type LogEntry struct {
 	Command interface{}
@@ -47,25 +64,47 @@ type ConsensusModule struct {
 	id      int     // id 是一致性模块中的服务器ID
 	peerIds []int   // peerIds 是集群中所有同伴的ID列表
 	server  *Server // server 是包含该CM的服务器. 该字段用于向其它同伴发起RPC调用
+	storage Storage
+
+	commitChan         chan<- CommitEntry // commitChan 是此 CM 将报告已提交日志条目的通道。它是在施工过程中由客户传入的。
+	newCommitReadyChan chan struct{}      // newCommitReadyChan 是 goroutines 使用的内部通知通道,它将新条目提交到日志以通知这些条目可能会在 commitChan 上发送。
+
+	triggerAEChan chan struct{} // triggerAEChan 是一个内部通知通道，用于在发生有趣的变化时触发向关注者发送新的 AE。
 
 	currentTerm int        // 服务器接收到的最新任期（启动时初始化为0，单调递增）
 	votedFor    int        // 在当前任期内收到赞同票的候选人ID（如果没有就是null）
 	log         []LogEntry // 日志条目；每个条目中 包含输入状态机的指令，以及领导者接收条目时的任期（第一个索引是1）
 
+	commitIndex        int // 确认已提交的日志条目的最大索引值（初始化为0，单调递增）
+	lastApplied        int // 应用于状态机的日志条目的最大索引值（初始化为0，单调递增）
 	state              CMState
 	electionResetEvent time.Time
+
+	nextIndex  map[int]int // 对于每个服务器，存储要发送给该服务器的下一条日志条目的索引（初始化为领导者的最新日志索引+1）
+	matchIndex map[int]int // 对于每个服务器，存储确认复制到该服务器的日志条目的最大索引值（初始化为0，单调递增）
 }
 
 // NewConsensusModule 使用给定的 ID、对等 ID 列表和
 // 服务器创建一个新的 CM。就绪通道向 CM 发出信号，所有对等点都已连接，并且
 // 可以安全地启动其状态机。
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.commitChan = commitChan
+	cm.newCommitReadyChan = make(chan struct{}, 16)
+	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.state = Follower
 	cm.votedFor = -1
+	cm.commitIndex = -1
+	cm.lastApplied = -1
+	cm.nextIndex = make(map[int]int)
+	cm.matchIndex = make(map[int]int)
+
+	if cm.storage.HasData() {
+		cm.restoreFromStorage(cm.storage)
+	}
 
 	go func() {
 		// CM 处于静止状态，直到发出就绪信号；然后，它开始倒计时以进行领导者选举。
@@ -76,6 +115,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 		cm.runElectionTimer()
 	}()
 
+	go cm.commitChanSender()
 	return cm
 }
 
@@ -83,6 +123,29 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+/*
+	Submit方法会向CM呈递一条新的指令。这个函数是非阻塞的;
+	客户端读取构造函数中传入的commit channel，以获得新提交条目的通知。
+	如果当前CM是领导者返回true——表示指令被接受了。
+	如果返回false，客户端会寻找新的服务器呈递该指令。
+*/
+func (cm *ConsensusModule) Submit(command interface{}) bool {
+	cm.mu.Lock()
+
+	cm.dlog("Submit received by %v: %v", cm.state, command)
+	if cm.state == Leader {
+		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage()
+		cm.dlog("... log=%v", cm.log)
+		cm.mu.Unlock()
+		cm.triggerAEChan <- struct{}{}
+		return true
+	}
+
+	cm.mu.Unlock()
+	return false
 }
 
 // Stop 停止这个 CM，清理它的状态。这个方法返回很快，但是
@@ -93,6 +156,54 @@ func (cm *ConsensusModule) Stop() {
 	defer cm.mu.Unlock()
 	cm.state = Dead
 	cm.dlog("becomes Dead")
+	close(cm.newCommitReadyChan)
+}
+
+func (cm *ConsensusModule) restoreFromStorage(storage Storage) {
+	if termData, found := cm.storage.Get("currentTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.currentTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("currentTerm not found in storage")
+	}
+	if votedData, found := cm.storage.Get("votedFor"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(votedData))
+		if err := d.Decode(&cm.votedFor); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("votedFor not found in storage")
+	}
+	if logData, found := cm.storage.Get("log"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(logData))
+		if err := d.Decode(&cm.log); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		log.Fatal("log not found in storage")
+	}
+}
+
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
 }
 
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
@@ -121,8 +232,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	if cm.state == Dead {
 		return nil
 	}
-
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 
 	// 请求中的任期大于本地任期，转换为追随者状态
 	if args.Term > cm.currentTerm {
@@ -131,7 +242,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 
 	// 任期相同，且未投票或已投票给当前请求同伴，则返回赞成投票；否则，返回反对投票。
-	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateId
 		cm.electionResetEvent = time.Now()
@@ -139,6 +251,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -156,6 +269,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm，当前任期，回复给领导者。领导者用于自我更新
 	Success bool // 如果追随者保存了prevLogIndex和prevLogTerm相匹配的日志条目，则返回true
+
+	ConflictIndex int //
+	ConflictTerm  int
 }
 
 // AE请求 由领导者发起，用于向追随者复制客户端指令，也用于维护心跳
@@ -180,10 +296,65 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
-		reply.Success = true
+
+		// 检查本地的日志在索引PrevLogIndex处是否包含任期与PrevLogTerm匹配的记录？
+		// 注意在PrevLogIndex=-1的极端情况下，这里应该是true
+		if args.PrevLogIndex == -1 || (args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			reply.Success = true
+
+			// 找到插入点 —— 索引从PrevLogIndex+1开始的本地日志与RPC发送的新条目间出现任期不匹配的位置。
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+
+			for {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+
+			/*
+				循环结束时：
+				- logInsertIndex指向本地日志结尾，或者是与领导者发送日志间存在任期冲突的索引位置
+				- newEntriesIndex指向请求条目的结尾，或者是与本地日志存在任期冲突的索引位置
+			*/
+			if newEntriesIndex < len(args.Entries) {
+				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.dlog("... log is now: %v", cm.log)
+			}
+
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
+				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+		} else {
+			if args.PrevLogIndex >= len(cm.log) {
+				reply.ConflictIndex = len(cm.log)
+				reply.ConflictTerm = -1
+			} else {
+				// PrevLogIndex points within our log, but PrevLogTerm doesn't match
+				// cm.log[PrevLogIndex].
+				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+
+				var i int
+				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
+					}
+				}
+				reply.ConflictIndex = i + 1
+			}
+		}
 	}
 
 	reply.Term = cm.currentTerm
+	cm.persistToStorage()
 	cm.dlog("AppendEntries reply: %+v", *reply)
 	return nil
 }
@@ -267,9 +438,15 @@ func (cm *ConsensusModule) startElection() {
 
 	for _, peerId := range cm.peerIds {
 		go func(peerId int) {
+			cm.mu.Lock()
+			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			cm.mu.Unlock()
+
 			args := RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateId: cm.id,
+				Term:         savedCurrentTerm,
+				CandidateId:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
 			}
 			var reply RequestVoteReply
 
@@ -323,51 +500,193 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
 
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+
+	/*
+		该goroutine在后台运行并向同伴服务器发送AE请求：
+		- triggerAEChan通道发送任何内容时
+		- 如果triggerAEChan通道没有内容时，每50ms执行一次
+	*/
+	go func(heartbeatTimeout time.Duration) {
+		// Immediately send AEs to peers.
+		cm.leaderSendAEs()
+
+		t := time.NewTimer(heartbeatTimeout)
+		defer t.Stop()
 
 		// 只要当前服务器是领导者，就要周期性发送心跳
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
+			doSend := false
+			select {
+			case <-t.C:
+				doSend = true
 
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
+				// Reset timer to fire again after heartbeatTimeout.
+				t.Stop()
+				t.Reset(heartbeatTimeout)
+			case _, ok := <-cm.triggerAEChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+
+				// Reset timer for heartbeatTimeout.
+				if !t.Stop() {
+					<-t.C
+				}
+				t.Reset(heartbeatTimeout)
 			}
-			cm.mu.Unlock()
+
+			if doSend {
+				cm.mu.Lock()
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					return
+				}
+				cm.mu.Unlock()
+				cm.leaderSendAEs()
+			}
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
 	// 向所有追随者发送AE请求
 	for _, peerId := range cm.peerIds {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderId: cm.id,
-		}
 		go func(peerId int) {
-			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
+			cm.mu.Lock()
+			ni := cm.nextIndex[peerId]
+			prevLogIndex := ni - 1
+			prevLogTerm := -1
+			if prevLogIndex >= 0 {
+				prevLogTerm = cm.log[prevLogIndex].Term
+			}
+			entries := cm.log[ni:]
+
+			args := AppendEntriesArgs{
+				Term:         savedCurrentTerm,
+				LeaderId:     cm.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: cm.commitIndex,
+			}
+			cm.mu.Unlock()
+			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				// 如果响应消息中的任期大于当前任期，则表明集群有新的领导者，转换为追随者
 				if reply.Term > savedCurrentTerm {
 					cm.dlog("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
+
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					if reply.Success {
+						cm.nextIndex[peerId] = ni + len(entries)
+						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+
+						savedCommitIndex := cm.commitIndex
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							if cm.log[i].Term == cm.currentTerm {
+								matchCount := 1
+								for _, peerId := range cm.peerIds {
+									if cm.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								if matchCount*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+
+						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
+						if cm.commitIndex != savedCommitIndex {
+							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
+						}
+					} else {
+						if reply.ConflictTerm >= 0 {
+							lastIndexOfTerm := -1
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+							if lastIndexOfTerm >= 0 {
+								cm.nextIndex[peerId] = lastIndexOfTerm + 1
+							} else {
+								cm.nextIndex[peerId] = reply.ConflictIndex
+							}
+						} else {
+							cm.nextIndex[peerId] = reply.ConflictIndex
+						}
+						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+					}
+				}
 			}
 		}(peerId)
 	}
+}
+
+/*
+	commitChanSender负责在cm.commitChan上发送已提交的日志条目。
+	它会监听newCommitReadyChan的通知并检查哪些条目可以发送（给客户端）。
+	该方法应该在单独的后台goroutine中运行；cm.commitChan可能会有缓冲来限制客户端消费已提交指令的速度。
+	当newCommitReadyChan关闭时方法结束。
+*/
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(cm.log) > 0 {
+		lastIndex := len(cm.log) - 1
+		return lastIndex, cm.log[lastIndex].Term
+	} else {
+		return -1, -1
+	}
+}
+
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		// Find which entries we have to apply.
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+		var entries []LogEntry
+		if cm.commitIndex > cm.lastApplied {
+			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
+	}
+	cm.dlog("commitChanSender done")
+}
+
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
