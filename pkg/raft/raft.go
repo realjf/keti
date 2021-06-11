@@ -87,11 +87,12 @@ type ConsensusModule struct {
 // NewConsensusModule 使用给定的 ID、对等 ID 列表和
 // 服务器创建一个新的 CM。就绪通道向 CM 发出信号，所有对等点都已连接，并且
 // 可以安全地启动其状态机。
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.server = server
+	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
