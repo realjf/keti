@@ -5,8 +5,10 @@ go 1.16
 require (
 	github.com/BurntSushi/toml v0.3.1
 	github.com/fastly/go-utils v0.0.0-20180712184237-d95a45783239 // indirect
+	github.com/felixge/httpsnoop v1.0.2 // indirect
 	github.com/fortytw2/leaktest v1.3.0
 	github.com/gogf/gf v1.16.2
+	github.com/gorilla/handlers v1.5.1 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/jehiah/go-strftime v0.0.0-20171201141054-1d33003b3869 // indirect
 	github.com/joho/godotenv v1.3.0
