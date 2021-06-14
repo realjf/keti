@@ -4,3 +4,8 @@ GPATH=main.go
 
 run:
 	$(GCC) $(GCMD) $(GPATH)
+
+install:
+	go mod tidy
+
+

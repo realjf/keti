@@ -3,6 +3,10 @@ package main
 import (
 	"flag"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"log"
 
 	"github.com/joho/godotenv"
 	"github.com/realjf/keti/src/app"
@@ -33,8 +37,26 @@ func init() {
 }
 
 func main() {
-	s := app.NewServer()
+	srv := app.NewServer()
 
-	s.Init(port, dbConn)
-	s.Start()
+	go func() {
+		srv.Init(port, dbConn)
+		srv.Start()
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+	for {
+		s := <-c
+		log.Printf("keti get a signal %s\n", s.String())
+		switch s {
+		case syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
+
+			log.Println("keti exit")
+			return
+		case syscall.SIGHUP:
+		default:
+			return
+		}
+	}
 }

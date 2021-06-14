@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/realjf/keti/src/router"
 	"gorm.io/gorm"
 )
 
@@ -24,5 +25,8 @@ func (s *Server) Init(port string, db *gorm.DB) {
 
 func (s *Server) Start() {
 	log.Println("starting server on port " + s.port)
-	http.ListenAndServe(s.port, nil)
+
+	r := router.NewRouter()
+	r.Init()
+	http.ListenAndServe(s.port, r.Router)
 }
