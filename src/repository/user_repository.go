@@ -11,6 +11,7 @@ import (
 type UserRepository interface {
 	InsertUser(user model.User) model.User
 	UpdateUser(user model.User) model.User
+	VerifyCredential(email string, password string) interface{}
 	FindByEmail(email string) model.User
 }
 
@@ -40,6 +41,15 @@ func (u *userRepository) UpdateUser(user model.User) model.User {
 	}
 	u.conn.Save(&user)
 	return user
+}
+
+func (u *userRepository) VerifyCredential(email string, password string) interface{} {
+	var user model.User
+	res := u.conn.Where("email = ?", email).Take(&user)
+	if res.Error == nil {
+		return user
+	}
+	return nil
 }
 
 func (u *userRepository) FindByEmail(email string) model.User {

@@ -4,7 +4,8 @@ import (
 	"net/http"
 
 	"github.com/realjf/keti/pkg/routes"
-	"github.com/realjf/keti/src/controller"
+	HomeHandler "github.com/realjf/keti/src/controller/home"
+	"gorm.io/gorm"
 )
 
 func Middleware(next http.Handler) http.Handler {
@@ -13,8 +14,11 @@ func Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func GetRoutes() routes.Routes {
+func GetRoutes(db *gorm.DB) routes.Routes {
+
+	HomeHandler.Init(db)
+
 	return routes.Routes{
-		routes.Route{"Home", "GET", "/", controller.Index},
+		routes.Route{"Home", "GET", "/", HomeHandler.Index},
 	}
 }

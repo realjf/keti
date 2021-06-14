@@ -4,6 +4,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/realjf/keti/pkg/routes"
 	V1SubRoutes "github.com/realjf/keti/src/controller/v1/router"
+	"gorm.io/gorm"
 )
 
 type Router struct {
@@ -17,10 +18,11 @@ func NewRouter() *Router {
 	return r
 }
 
-func (r *Router) Init() {
+func (r *Router) Init(db *gorm.DB) {
+
 	r.Router.Use(Middleware)
 
-	baseRoutes := GetRoutes()
+	baseRoutes := GetRoutes(db)
 	for _, route := range baseRoutes {
 		r.Router.
 			Methods(route.Method).
@@ -29,7 +31,7 @@ func (r *Router) Init() {
 			Handler(route.HandlerFunc)
 	}
 
-	v1SubRoutes := V1SubRoutes.GetRoutes()
+	v1SubRoutes := V1SubRoutes.GetRoutes(db)
 	for name, pack := range v1SubRoutes {
 		r.AttachSubRouterWithMiddleware(name, pack.Routes, pack.Middleware)
 	}

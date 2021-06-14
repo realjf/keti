@@ -30,7 +30,7 @@ func (s *Server) Start() {
 	log.Println("starting server on port " + s.port)
 
 	r := router.NewRouter()
-	r.Init()
+	r.Init(s.db)
 
 	handler := handlers.LoggingHandler(os.Stdout, handlers.CORS(
 		handlers.AllowedOrigins([]string{"*"}),
